@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="uwpspatialsoundtest/uwpspatialsoundtest.vcxproj" Id="d41be613-63bd-4ba7-ad0c-e06db797eacc" />
+</Solution>
