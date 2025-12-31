@@ -19,45 +19,91 @@ struct Speaker3dObject {
     Microsoft::WRL::ComPtr<ISpatialAudioObject> audioObject;
     Windows::Foundation::Numerics::float3 position;
     float volume;
+    std::vector<float>* wavSample;
     UINT totalFrameCount;
     UINT currFrameIndex;   // Since chunks of audio are written to buffer
 };
 
-
-// Something the demo uses to write sine PCM waves to buffer
-//void WriteToAudioObjectBuffer(FLOAT* buffer, UINT frameCount, FLOAT frequency, UINT samplingRate)
-//{
-//    const double PI = 4 * atan2(1.0, 1.0);
-//    static double _radPhase = 0.0;
-//
-//    double step = 2 * PI * frequency / samplingRate;
-//
-//    for (UINT i = 0; i < frameCount; i++)
-//    {
-//        double sample = sin(_radPhase);
-//
-//        buffer[i] = FLOAT(sample);
-//
-//        _radPhase += step; // next frame phase
-//
-//        if (_radPhase >= 2 * PI)
-//        {
-//            _radPhase -= 2 * PI;
-//        }
-//    }
-//}
-
 // Writes frameCount samples from PCM sample vector to buffer
 UINT WriteToAudioObjectBuffer(FLOAT* buffer, UINT frameCount, const std::vector<float> &data, UINT &pos) {
     UINT writeLen = min(frameCount, static_cast<UINT>(max(0, data.size() - pos)));
-    if(writeLen > 0) {
+    if (writeLen > 0) {
         memcpy(buffer, data.data() + pos, sizeof(float) * writeLen);
 		pos += writeLen;
     }
-    if(writeLen < frameCount) {
+    if (writeLen < frameCount) {
 		memset(buffer + writeLen, 0, sizeof(float) * (frameCount - writeLen)); // Zero-fill remainder
     }
     return writeLen; // Required for ISpatialAudioObjectBase::SetEndOfStream
+}
+
+inline void BiquadFilter(std::vector<float>& wavSamples, float a1, float a2, float b02, float b1) {
+    float y = 0.0f;
+    float prevTerm = 0.0f;
+    float prevPrevTerm = 0.0f;
+    std::vector<float>::iterator it = wavSamples.begin();
+    while (it != wavSamples.end()) {
+        y = b02 * (*it) + prevTerm;
+        prevTerm = b1 * (*it) - a1 * y + prevPrevTerm;
+        prevPrevTerm = b02 * (*it) - a2 * y;
+        *it = y;
+        it++;
+    }
+}
+
+inline void OnePole(std::vector<float>& wavSamples, float freqCutoff, UINT sampleRate) {
+    float a = std::exp(-2.0f * std::_Pi_val * freqCutoff / sampleRate);
+    float b = 1.0f - a;
+    float prevY = 0.0f;
+    std::vector<float>::iterator it = wavSamples.begin();
+    while (it != wavSamples.end()) {
+        *it = b * (*it) + a * prevY;
+        prevY = *it;
+        it++;
+    }
+}
+
+// Low-pass filter, uses two second-order IIR filters
+void LowPassFilter(std::vector<float> &wavSamples, float freqCutoff, UINT sampleRate) {
+    // Approximation of w0 from https://dsp.stackexchange.com/questions/28308/3-db-cut-off-frequency-of-exponentially-weighted-moving-average-filter/28314#28314
+    // Biquad filter from https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
+	// The Q values are from 4th-order Butterworth low-pass Perplexity got that I don't feel qualified to understand
+    float w0 = 2.0f * std::_Pi_val * freqCutoff / sampleRate;
+	float cosw0 = std::cos(w0);
+	float sinw0 = std::sin(w0);
+    float alpha0 = sinw0 * 0.5f * 0.54119611f;
+	float alpha1 = sinw0 * 0.5f * 1.30656296f;
+
+	float a0 = 1.0f + alpha0;
+	float a1 = -2.0f * cosw0;
+	float a2 = 1.0f - alpha0;
+    float b1 = 1.0f - cosw0;
+	float b02 = b1 * 0.5f;
+    BiquadFilter(wavSamples, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
+
+    a0 = 1.0f + alpha1;
+    a2 = 1.0f - alpha1;
+    BiquadFilter(wavSamples, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
+}
+
+// High-pass filter, same concept
+void HighPassFilter(std::vector<float>& wavSamples, float freqCutoff, UINT sampleRate) {
+    float w0 = 2.0f * std::_Pi_val * freqCutoff / sampleRate;
+    float cosw0 = std::cos(w0);
+    float sinw0 = std::sin(w0);
+    float alpha0 = sinw0 * 0.5f * 0.54119611f;
+    float alpha1 = sinw0 * 0.5f * 1.30656296f;
+
+    float a0 = 1.0f + alpha0;
+    float a1 = -2.0f * cosw0;
+    float a2 = 1.0f - alpha0;
+    float b1 = -(1.0f + cosw0);
+    float b02 = -b1 * 0.5f;
+    BiquadFilter(wavSamples, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
+
+    a0 = 1.0f + alpha1;
+    a2 = 1.0f - alpha1;
+    BiquadFilter(wavSamples, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
 }
 
 
@@ -69,7 +115,7 @@ static inline int32_t Int24ToInt32(const uint8_t bytes[3])
 {
     int32_t val = (bytes[0]) | (bytes[1] << 8) | (bytes[2] << 16);
     // sign extend if negative (bit 23 set)
-    if(val & 0x00800000) {
+    if (val & 0x00800000) {
         val |= 0xFF000000;
     }
     return val;
@@ -80,7 +126,7 @@ static inline int32_t Int24ToInt32(const uint8_t bytes[3])
 bool LoadWav24ToFloat(const std::wstring& path, std::vector<float>& outSamples, UINT& outSampleRate)
 {
     std::ifstream ifs(path, std::ios::binary);
-    if(!ifs) return false;
+    if (!ifs) return false;
 
     // Read RIFF header
     char riff[4];
@@ -89,7 +135,7 @@ bool LoadWav24ToFloat(const std::wstring& path, std::vector<float>& outSamples, 
     ifs.read(riff, 4);
     ifs.read(reinterpret_cast<char*>(&riffChunkSize), 4);
     ifs.read(wave, 4);
-    if(std::strncmp(riff, "RIFF", 4) != 0 || std::strncmp(wave, "WAVE", 4) != 0)
+    if (std::strncmp(riff, "RIFF", 4) != 0 || std::strncmp(wave, "WAVE", 4) != 0)
         return false;
 
     // Parse chunks
@@ -99,7 +145,7 @@ bool LoadWav24ToFloat(const std::wstring& path, std::vector<float>& outSamples, 
     uint16_t bitsPerSample = 0;
     std::vector<uint8_t> dataBytes;
 
-    while(ifs && !ifs.eof()) {
+    while (ifs && !ifs.eof()) {
         char chunkId[4];
         uint32_t chunkSize = 0;
         ifs.read(chunkId, 4);
@@ -110,7 +156,7 @@ bool LoadWav24ToFloat(const std::wstring& path, std::vector<float>& outSamples, 
         std::streampos nextChunk = ifs.tellg();
         nextChunk += static_cast<std::streamoff>(chunkSize);
 
-        if(std::strncmp(chunkId, "fmt ", 4) == 0) {
+        if (std::strncmp(chunkId, "fmt ", 4) == 0) {
             // Read format chunk (at least 16 bytes)
             if (chunkSize < 16) return false;
             ifs.read(reinterpret_cast<char*>(&audioFormat), sizeof(audioFormat));
@@ -123,7 +169,7 @@ bool LoadWav24ToFloat(const std::wstring& path, std::vector<float>& outSamples, 
             ifs.read(reinterpret_cast<char*>(&bitsPerSample), sizeof(bitsPerSample));
             // skip any extra fmt bytes
         }
-        else if(std::strncmp(chunkId, "data", 4) == 0) {
+        else if (std::strncmp(chunkId, "data", 4) == 0) {
             dataBytes.resize(chunkSize);
             ifs.read(reinterpret_cast<char*>(dataBytes.data()), chunkSize);
         }
@@ -131,9 +177,9 @@ bool LoadWav24ToFloat(const std::wstring& path, std::vector<float>& outSamples, 
         ifs.seekg(nextChunk);
     }
 
-    if(audioFormat != 1) return false; // expect PCM (1)
-    if(numChannels != 1) return false;  // expect mono
-    if(bitsPerSample != 24) return false; // expect 24-bit
+    if (audioFormat != 1) return false; // expect PCM (1)
+    if (numChannels != 1) return false;  // expect mono
+    if (bitsPerSample != 24) return false; // expect 24-bit
 
     // Convert 3-byte samples to float
     const size_t bytesPerSample = 3;
@@ -181,34 +227,56 @@ void ResampleLinear(const std::vector<float>& in, UINT inRate, UINT outRate, std
 
 int main(int argc, char* argv[]) {
     // Getting WAV file (test file uses 24-bit, mono, 44.100kHz at the moment)
-    if(argc < 2) {
-		std::cerr << "Please provide a path to a mono 24-bit WAV file as an argument." << std::endl;
+    if (argc < 3) {
+		std::cerr << "Need a path to a mono 24-bit WAV file as an argument, separate LR channels." << std::endl;
         return 1;
     }
 	
 	std::setlocale(LC_ALL, ""); // Default locale
 	size_t requiredSize = strlen(argv[1]) + 1;
-	wchar_t* pwc = new wchar_t[requiredSize];
+	wchar_t* leftPwc = new wchar_t[requiredSize];
     size_t outWSize;
-	mbstowcs_s(&outWSize, pwc, requiredSize, argv[1], requiredSize - 1);
-    std::wstring wavPath(pwc);
-    delete[] pwc;
+	mbstowcs_s(&outWSize, leftPwc, requiredSize, argv[1], requiredSize - 1);
+    std::wstring leftWavPath(leftPwc);
+    delete[] leftPwc;
+
+    requiredSize = strlen(argv[2]) + 1;
+    wchar_t* rightPwc = new wchar_t[requiredSize];
+    mbstowcs_s(&outWSize, rightPwc, requiredSize, argv[2], requiredSize - 1);
+    std::wstring rightWavPath(rightPwc);
+    delete[] rightPwc;
+
+    std::wcout << "Loading WAV files: " << leftWavPath << " (left), " << rightWavPath << " (right)" << std::endl;
 
     // Load WAV samples into vector<float>
-	std::vector<float> wavSamples;
+	std::vector<float> leftWavSamples;
 	UINT wavSampleRate;
-	if(!LoadWav24ToFloat(wavPath, wavSamples, wavSampleRate)) {
-        std::cerr << "Failed to load WAV" << std::endl;
+	if (!LoadWav24ToFloat(leftWavPath, leftWavSamples, wavSampleRate)) {
+        std::cerr << "Failed to load WAV (left)." << std::endl;
         return 1;
 	}
 
+	//HighPassFilter(leftWavSamples, 200.0f, wavSampleRate);
+
     // Resample to 48kHz
     const UINT targetRate = 48000;
-    if(wavSampleRate != targetRate) {
+    if (wavSampleRate != targetRate) {
         std::vector<float> resampled;
-        ResampleLinear(wavSamples, wavSampleRate, targetRate, resampled);
-        wavSamples.swap(resampled);
-        wavSampleRate = targetRate;
+        ResampleLinear(leftWavSamples, wavSampleRate, targetRate, resampled);
+        leftWavSamples.swap(resampled);
+    }
+
+
+    std::vector<float> rightWavSamples;
+    if (!LoadWav24ToFloat(rightWavPath, rightWavSamples, wavSampleRate)) {
+        std::cerr << "Failed to load WAV (right)." << std::endl;
+        return 1;
+    }
+    //HighPassFilter(rightWavSamples, 200.0f, wavSampleRate);
+    if (wavSampleRate != targetRate) {
+        std::vector<float> resampled;
+        ResampleLinear(rightWavSamples, wavSampleRate, targetRate, resampled);
+        rightWavSamples.swap(resampled);
     }
 
 
@@ -222,12 +290,12 @@ int main(int argc, char* argv[]) {
 
 
 
-    // This is where the audio format is specified (32-bit, mono, 48kHz)
+    // This is where the audio format is specified (32-bit, mono, 48kHz, likely according to system settings)
     WAVEFORMATEX format;
     format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
     format.wBitsPerSample = 32;
     format.nChannels = 1;
-    format.nSamplesPerSec = wavSampleRate;
+    format.nSamplesPerSec = targetRate;
     format.nBlockAlign = (format.wBitsPerSample >> 3) * format.nChannels;
     format.nAvgBytesPerSec = format.nBlockAlign * format.nSamplesPerSec;
     format.cbSize = 0;
@@ -239,7 +307,7 @@ int main(int argc, char* argv[]) {
     hr = defaultDevice->Activate(__uuidof(ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**)&spatialAudioClient);
 
     hr = spatialAudioClient->IsAudioObjectFormatSupported(&format);
-    if(FAILED(hr)) {
+    if (FAILED(hr)) {
 		std::cerr << "Audio object format not supported by spatial audio client." << std::endl;
         return 1;
     }
@@ -251,7 +319,7 @@ int main(int argc, char* argv[]) {
     UINT32 maxDynamicObjectCount;
     hr = spatialAudioClient->GetMaxDynamicObjectCount(&maxDynamicObjectCount);
 
-    if(maxDynamicObjectCount == 0) {
+    if (maxDynamicObjectCount == 0) {
         // Dynamic objects are unsupported
         return 1;
     }
@@ -277,44 +345,66 @@ int main(int argc, char* argv[]) {
 
     // Start streaming / rendering 
     hr = spatialAudioStream->Start();
-    Microsoft::WRL::ComPtr<ISpatialAudioObject> audioObject;
-    hr = spatialAudioStream->ActivateSpatialAudioObject(AudioObjectType::AudioObjectType_Dynamic, &audioObject);
+
+	std::vector<std::vector<float>> wavSamples = { leftWavSamples, rightWavSamples };
+    std::vector<Windows::Foundation::Numerics::float3> positions = {
+        Windows::Foundation::Numerics::float3(-1.0f, 1.0f, 0.0f),
+        Windows::Foundation::Numerics::float3(1.0f, 1.0f, 0.0f)
+	};
+	std::vector<size_t> channels = { 0, 1 };
+    std::vector<Speaker3dObject> speakerObjects;
 
     // Initializing sound object
-	Speaker3dObject leftSpeakerObj;
-	leftSpeakerObj.audioObject = audioObject;
-	leftSpeakerObj.position = Windows::Foundation::Numerics::float3(-1.0f, 0.0f, 0.0f); // Left by 1 meter (I think)
-	leftSpeakerObj.volume = 1.0f;
-    leftSpeakerObj.totalFrameCount = static_cast<UINT>(wavSamples.size());
-    leftSpeakerObj.currFrameIndex = 0;
+    for (size_t i = 0; i < positions.size(); i++) {
+        Microsoft::WRL::ComPtr<ISpatialAudioObject> audioObject;
+        hr = spatialAudioStream->ActivateSpatialAudioObject(AudioObjectType::AudioObjectType_Dynamic, &audioObject);
+        speakerObjects.push_back({
+            audioObject,
+            positions.at(i), // Left by 1 meter (I think)
+            1.0, // Volume
+            &wavSamples.at(channels.at(i)),
+            static_cast<UINT>(wavSamples.at(channels.at(i)).size()),
+            0
+        });
+    }
 
-	bool streaming = true;
-    while(streaming) {
+	std::cout << "Beginning spatial audio streaming." << std::endl;
+
+    bool streaming = true;
+    while (streaming) {
         // Wait for a signal from the audio-engine to start the next processing pass
         if (WaitForSingleObject(bufferCompletionEvent, 100) != WAIT_OBJECT_0) {
             break;
         }
 
         UINT32 availableDynamicObjectCount;
-		UINT32 frameCount;
-		hr = spatialAudioStream->BeginUpdatingAudioObjects(&availableDynamicObjectCount, &frameCount);
+        UINT32 frameCount;
+
+        hr = spatialAudioStream->BeginUpdatingAudioObjects(&availableDynamicObjectCount, &frameCount);
 
         BYTE* buffer;
-		UINT32 bufferLength;
+        UINT32 bufferLength;
 
-		hr = leftSpeakerObj.audioObject->GetBuffer(&buffer, &bufferLength);
+        std::vector<Speaker3dObject>::iterator it = speakerObjects.begin();
+        while (it != speakerObjects.end()) {
+            hr = it->audioObject->GetBuffer(&buffer, &bufferLength);
+            UINT writeLen = 0;
 
-        // Write audio to available frames
-        UINT writeLen = WriteToAudioObjectBuffer(reinterpret_cast<float*>(buffer), frameCount, wavSamples, leftSpeakerObj.currFrameIndex);
-        leftSpeakerObj.audioObject->SetPosition(leftSpeakerObj.position.x, leftSpeakerObj.position.y, leftSpeakerObj.position.z);
-        leftSpeakerObj.audioObject->SetVolume(leftSpeakerObj.volume);
-
-        // End of data
-        if (leftSpeakerObj.currFrameIndex >= leftSpeakerObj.totalFrameCount) {
-            hr = leftSpeakerObj.audioObject->SetEndOfStream(writeLen);
-            leftSpeakerObj.audioObject = nullptr;
-            leftSpeakerObj.totalFrameCount = 0;
-            streaming = false;
+            // End of data
+            if (it->totalFrameCount >= it->currFrameIndex) {
+                // Write audio to available frames
+                writeLen = WriteToAudioObjectBuffer(reinterpret_cast<float*>(buffer), frameCount, *(it->wavSample), it->currFrameIndex);
+                it->audioObject->SetPosition(it->position.x, it->position.y, it->position.z);
+                it->audioObject->SetVolume(it->volume);
+                it++;
+            }
+            else {
+                hr = it->audioObject->SetEndOfStream(writeLen);
+                it->audioObject = nullptr;
+                it->totalFrameCount = 0;
+				it = speakerObjects.erase(it);
+                streaming = false;
+            }
         }
 
         hr = spatialAudioStream->EndUpdatingAudioObjects();
@@ -429,14 +519,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
-// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
-// Debug program: F5 or Debug > Start Debugging menu
-
-// Tips for Getting Started: 
-//   1. Use the Solution Explorer window to add/manage files
-//   2. Use the Team Explorer window to connect to source control
-//   3. Use the Output window to see build output and other messages
-//   4. Use the Error List window to view errors
-//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
-//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
