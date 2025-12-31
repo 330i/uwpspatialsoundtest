@@ -12,13 +12,16 @@
 #include <wrl/wrappers/corewrappers.h>
 #include <wrl/client.h>
 #include <SpatialAudioClient.h>
+#include <SpatialAudioHrtf.h>
 #include <mmdeviceapi.h>
+#include <directxmath.h>
 
 // Audio object struct
 struct Speaker3dObject {
-    Microsoft::WRL::ComPtr<ISpatialAudioObject> audioObject;
-    Windows::Foundation::Numerics::float3 position;
-    float volume;
+    Microsoft::WRL::ComPtr<ISpatialAudioObjectForHrtf> audioObject;
+	Windows::Foundation::Numerics::float3 position; // In meters
+    SpatialAudioHrtfOrientation* orientation;
+    float gain; // In decibels
     std::vector<float>* wavSample;
     UINT totalFrameCount;
     UINT currFrameIndex;   // Since chunks of audio are written to buffer
@@ -104,6 +107,52 @@ void HighPassFilter(std::vector<float>& wavSamples, float freqCutoff, UINT sampl
     a0 = 1.0f + alpha1;
     a2 = 1.0f - alpha1;
     BiquadFilter(wavSamples, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
+}
+
+// Calculates orientation matrix, provided by Microsoft article
+DirectX::XMMATRIX CalculateEmitterOrientationMatrix(Windows::Foundation::Numerics::float3 listenerOrientationFront, Windows::Foundation::Numerics::float3 emitterDirection)
+{
+    DirectX::XMVECTOR vListenerDirection = DirectX::XMLoadFloat3(&listenerOrientationFront);
+    DirectX::XMVECTOR vEmitterDirection = DirectX::XMLoadFloat3(&emitterDirection);
+    DirectX::XMVECTOR vCross = DirectX::XMVector3Cross(vListenerDirection, vEmitterDirection);
+    DirectX::XMVECTOR vDot = DirectX::XMVector3Dot(vListenerDirection, vEmitterDirection);
+    DirectX::XMVECTOR vAngle = DirectX::XMVectorACos(vDot);
+    float angle = DirectX::XMVectorGetX(vAngle);
+
+    // The angle must be non-zero
+    if (fabsf(angle) > FLT_EPSILON)
+    {
+        // And less than PI
+        if (fabsf(angle) < DirectX::XM_PI)
+        {
+            return DirectX::XMMatrixRotationAxis(vCross, angle);
+        }
+
+        // If equal to PI, find any other non-collinear vector to generate the perpendicular vector to rotate about
+        else
+        {
+            DirectX::XMFLOAT3 vector = { 1.0f, 1.0f, 1.0f };
+            if (listenerOrientationFront.x != 0.0f)
+            {
+                vector.x = -listenerOrientationFront.x;
+            }
+            else if (listenerOrientationFront.y != 0.0f)
+            {
+                vector.y = -listenerOrientationFront.y;
+            }
+            else // if (_listenerOrientationFront.z != 0.0f)
+            {
+                vector.z = -listenerOrientationFront.z;
+            }
+            DirectX::XMVECTOR vVector = DirectX::XMLoadFloat3(&vector);
+            vVector = DirectX::XMVector3Normalize(vVector);
+            vCross = DirectX::XMVector3Cross(vVector, vEmitterDirection);
+            return DirectX::XMMatrixRotationAxis(vCross, angle);
+        }
+    }
+
+    // If the angle is zero, use an identity matrix
+    return DirectX::XMMatrixIdentity();
 }
 
 
@@ -306,6 +355,13 @@ int main(int argc, char* argv[]) {
     Microsoft::WRL::ComPtr<ISpatialAudioClient> spatialAudioClient;
     hr = defaultDevice->Activate(__uuidof(ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**)&spatialAudioClient);
 
+    Microsoft::WRL::ComPtr<ISpatialAudioObjectRenderStreamForHrtf> spatialAudioStreamHrtf;
+	hr = spatialAudioClient->IsSpatialAudioStreamAvailable(__uuidof(ISpatialAudioObjectRenderStreamForHrtf), nullptr);
+    if (FAILED(hr)) {
+        std::cerr << "HRTF spatial audio not supported by spatial audio client." << std::endl;
+        return 1;
+    }
+
     hr = spatialAudioClient->IsAudioObjectFormatSupported(&format);
     if (FAILED(hr)) {
 		std::cerr << "Audio object format not supported by spatial audio client." << std::endl;
@@ -324,8 +380,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Set the maximum number of dynamic audio objects that will be used
-    SpatialAudioObjectRenderStreamActivationParams streamParams;
+    SpatialAudioHrtfActivationParams streamParams;
     streamParams.ObjectFormat = &format;
     streamParams.StaticObjectTypeMask = AudioObjectType_None;
     streamParams.MinDynamicObjectCount = 0;
@@ -334,34 +389,78 @@ int main(int argc, char* argv[]) {
     streamParams.EventHandle = bufferCompletionEvent;
     streamParams.NotifyObject = nullptr;
 
+	// What is specified by the Microsoft article, with some modifications
+    SpatialAudioHrtfDistanceDecay decayModel;
+    decayModel.CutoffDistance = 20.0f;
+    decayModel.MaxGain = 3.98f;
+    decayModel.MinGain = float(1.58439 * pow(10, -5));
+    decayModel.Type = SpatialAudioHrtfDistanceDecayType::SpatialAudioHrtfDistanceDecay_CustomDecay;
+    decayModel.UnityGainDistance = 1.0f;
+
+    streamParams.DistanceDecay = &decayModel;
+
+    SpatialAudioHrtfDirectivity directivity;
+    directivity.Type = SpatialAudioHrtfDirectivityType::SpatialAudioHrtfDirectivity_Cardioid;
+    directivity.Scaling = 1.0f;
+
+    SpatialAudioHrtfDirectivityCardioid cardioid;
+    cardioid.directivity = directivity;
+	cardioid.Order = 0.0f; // Probably how forward focused the cardioid is, higher is narrower (probably useful for different frequencies)
+
+    SpatialAudioHrtfDirectivityUnion directivityUnion;
+    directivityUnion.Cardiod = cardioid; // Spelling typo
+    streamParams.Directivity = &directivityUnion;
+
+    SpatialAudioHrtfEnvironmentType environment = SpatialAudioHrtfEnvironmentType::SpatialAudioHrtfEnvironment_Small;
+    streamParams.Environment = &environment;
+
+    SpatialAudioHrtfOrientation orientation = { 1,0,0,0,1,0,0,0,1 }; // identity matrix
+    streamParams.Orientation = &orientation;
+
     PROPVARIANT pv;
     PropVariantInit(&pv);
     pv.vt = VT_BLOB;
     pv.blob.cbSize = sizeof(streamParams);
     pv.blob.pBlobData = (BYTE*)&streamParams;
 
-    Microsoft::WRL::ComPtr<ISpatialAudioObjectRenderStream> spatialAudioStream;
-    hr = spatialAudioClient->ActivateSpatialAudioStream(&pv, __uuidof(spatialAudioStream), (void**)&spatialAudioStream);
+    hr = spatialAudioClient->ActivateSpatialAudioStream(&pv, __uuidof(spatialAudioStreamHrtf), (void**)&spatialAudioStreamHrtf);
 
     // Start streaming / rendering 
-    hr = spatialAudioStream->Start();
+    hr = spatialAudioStreamHrtf->Start();
 
 	std::vector<std::vector<float>> wavSamples = { leftWavSamples, rightWavSamples };
     std::vector<Windows::Foundation::Numerics::float3> positions = {
-        Windows::Foundation::Numerics::float3(-1.0f, 1.0f, 0.0f),
-        Windows::Foundation::Numerics::float3(1.0f, 1.0f, 0.0f)
+        Windows::Foundation::Numerics::float3(-1.0f, 0.0f, 0.0f),
+        //Windows::Foundation::Numerics::float3(1.0f, 1.0f, 0.0f)
 	};
+    std::vector<Windows::Foundation::Numerics::float3> directions = {
+		Windows::Foundation::Numerics::float3(1.0f, 0.0f, 0.0f), // Assumed unit vector at the moment
+        Windows::Foundation::Numerics::float3(1.0f, 0.0f, 0.0f)
+    };
 	std::vector<size_t> channels = { 0, 1 };
     std::vector<Speaker3dObject> speakerObjects;
 
+    Windows::Foundation::Numerics::float3 listenerDirection(0.0f, 0.0f, 1.0f);
+
     // Initializing sound object
     for (size_t i = 0; i < positions.size(); i++) {
-        Microsoft::WRL::ComPtr<ISpatialAudioObject> audioObject;
-        hr = spatialAudioStream->ActivateSpatialAudioObject(AudioObjectType::AudioObjectType_Dynamic, &audioObject);
+        Microsoft::WRL::ComPtr<ISpatialAudioObjectForHrtf> audioObject;
+        hr = spatialAudioStreamHrtf->ActivateSpatialAudioObjectForHrtf(AudioObjectType::AudioObjectType_Dynamic, &audioObject);
+
+        DirectX::XMFLOAT4X4 rotationMatrix;
+        DirectX::XMMATRIX rotation = CalculateEmitterOrientationMatrix(directions.at(i), listenerDirection);
+        DirectX::XMStoreFloat4x4(&rotationMatrix, rotation); // Unload from vector registor
+        SpatialAudioHrtfOrientation orientation = {
+            rotationMatrix._11, rotationMatrix._12, rotationMatrix._13,
+            rotationMatrix._21, rotationMatrix._22, rotationMatrix._23,
+            rotationMatrix._31, rotationMatrix._32, rotationMatrix._33
+        };
+
         speakerObjects.push_back({
             audioObject,
-            positions.at(i), // Left by 1 meter (I think)
-            1.0, // Volume
+            positions.at(i),
+			&orientation,
+            20.0f,
             &wavSamples.at(channels.at(i)),
             static_cast<UINT>(wavSamples.at(channels.at(i)).size()),
             0
@@ -369,7 +468,8 @@ int main(int argc, char* argv[]) {
     }
 
 	std::cout << "Beginning spatial audio streaming." << std::endl;
-
+    
+	float rotateAngle = 0.0f;
     bool streaming = true;
     while (streaming) {
         // Wait for a signal from the audio-engine to start the next processing pass
@@ -380,7 +480,7 @@ int main(int argc, char* argv[]) {
         UINT32 availableDynamicObjectCount;
         UINT32 frameCount;
 
-        hr = spatialAudioStream->BeginUpdatingAudioObjects(&availableDynamicObjectCount, &frameCount);
+        hr = spatialAudioStreamHrtf->BeginUpdatingAudioObjects(&availableDynamicObjectCount, &frameCount);
 
         BYTE* buffer;
         UINT32 bufferLength;
@@ -394,8 +494,17 @@ int main(int argc, char* argv[]) {
             if (it->totalFrameCount >= it->currFrameIndex) {
                 // Write audio to available frames
                 writeLen = WriteToAudioObjectBuffer(reinterpret_cast<float*>(buffer), frameCount, *(it->wavSample), it->currFrameIndex);
-                it->audioObject->SetPosition(it->position.x, it->position.y, it->position.z);
-                it->audioObject->SetVolume(it->volume);
+
+                // Audio object has to be updated for each iteration, will return to default value if only set once
+				hr = it->audioObject->SetPosition(it->position.x, it->position.y, it->position.z);
+                hr = it->audioObject->SetGain(it->gain); // Gain just doesn't work
+				rotateAngle += 0.02f;
+				it->position = Windows::Foundation::Numerics::float3(cos(rotateAngle), 0.0f, sin(rotateAngle));
+				hr = it->audioObject->SetDistanceDecay(&decayModel); // Decay (not cutoff) depends on what direction the audio source is facing, some directions don't have decay at all
+				hr = it->audioObject->SetDirectivity(&directivityUnion); // Directivity likely sets decay rate for different directions
+                hr = it->audioObject->SetEnvironment(environment);
+                hr = it->audioObject->SetOrientation(&orientation);
+
                 it++;
             }
             else {
@@ -407,113 +516,14 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        hr = spatialAudioStream->EndUpdatingAudioObjects();
+        hr = spatialAudioStreamHrtf->EndUpdatingAudioObjects();
     }
 
-    
-	// From Microsoft article, spawns a bunch of sine waves around listener
-    //// Used for generating a vector of randomized My3DObject structs
-    //std::vector<My3dObject> objectVector;
-    //std::default_random_engine gen;
-    //std::uniform_real_distribution<> pos_dist(-25, 25); // uniform distribution for random position
-    //std::uniform_real_distribution<> vel_dist(-1, 1); // uniform distribution for random velocity
-    //std::uniform_real_distribution<> vol_dist(0.5, 1.0); // uniform distribution for random volume
-    //std::uniform_real_distribution<> pitch_dist(40, 400); // uniform distribution for random pitch
-    //int spawnCounter = 0;
-    // 
-    //do
-    //{
-    //    // Wait for a signal from the audio-engine to start the next processing pass
-    //    if (WaitForSingleObject(bufferCompletionEvent, 100) != WAIT_OBJECT_0)
-    //    {
-    //        break;
-    //    }
-
-    //    UINT32 availableDynamicObjectCount;
-    //    UINT32 frameCount;
-
-    //    // Begin the process of sending object data and metadata
-    //    // Get the number of active objects that can be used to send object-data
-    //    // Get the frame count that each buffer will be filled with 
-    //    hr = spatialAudioStream->BeginUpdatingAudioObjects(&availableDynamicObjectCount, &frameCount);
-
-    //    BYTE* buffer;
-    //    UINT32 bufferLength;
-
-    //    // Spawn a new dynamic audio object every 200 iterations
-    //    if (spawnCounter % 200 == 0 && spawnCounter < 1000)
-    //    {
-    //        // Activate a new dynamic audio object
-    //        Microsoft::WRL::ComPtr<ISpatialAudioObject> audioObject;
-    //        hr = spatialAudioStream->ActivateSpatialAudioObject(AudioObjectType::AudioObjectType_Dynamic, &audioObject);
-
-    //        // If SPTLAUDCLNT_E_NO_MORE_OBJECTS is returned, there are no more available objects
-    //        if (SUCCEEDED(hr))
-    //        {
-    //            // Init new struct with the new audio object.
-    //            My3dObject obj = {
-    //                audioObject,
-    //                Windows::Foundation::Numerics::float3(static_cast<float>(pos_dist(gen)), static_cast<float>(pos_dist(gen)), static_cast<float>(pos_dist(gen))),
-    //                Windows::Foundation::Numerics::float3(static_cast<float>(vel_dist(gen)), static_cast<float>(vel_dist(gen)), static_cast<float>(vel_dist(gen))),
-    //                static_cast<float>(static_cast<float>(vol_dist(gen))),
-    //                static_cast<float>(static_cast<float>(pitch_dist(gen))),
-    //                format.nSamplesPerSec * 5 // 5 seconds of audio samples
-    //            };
-
-    //            objectVector.insert(objectVector.begin(), obj);
-    //        }
-    //    }
-    //    spawnCounter++;
-
-    //    // Loop through all dynamic audio objects
-    //    std::vector<My3dObject>::iterator it = objectVector.begin();
-    //    while (it != objectVector.end())
-    //    {
-    //        it->audioObject->GetBuffer(&buffer, &bufferLength);
-
-    //        if (it->totalFrameCount >= frameCount)
-    //        {
-    //            // Write audio data to the buffer
-    //            WriteToAudioObjectBuffer(reinterpret_cast<float*>(buffer), frameCount, it->frequency, format.nSamplesPerSec);
-
-    //            // Update the position and volume of the audio object
-    //            it->audioObject->SetPosition(it->position.x, it->position.y, it->position.z);
-    //            it->position += it->velocity;
-    //            it->audioObject->SetVolume(it->volume);
-
-    //            it->totalFrameCount -= frameCount;
-
-    //            ++it;
-    //        }
-    //        else
-    //        {
-    //            // If the audio object reaches its lifetime, set EndOfStream and release the object
-
-    //            // Write audio data to the buffer
-    //            WriteToAudioObjectBuffer(reinterpret_cast<float*>(buffer), it->totalFrameCount, it->frequency, format.nSamplesPerSec);
-
-    //            // Set end of stream for the last buffer 
-    //            hr = it->audioObject->SetEndOfStream(it->totalFrameCount);
-
-    //            it->audioObject = nullptr; // Release the object
-
-    //            it->totalFrameCount = 0;
-
-    //            it = objectVector.erase(it);
-    //        }
-    //    }
-
-    //    // Let the audio-engine know that the object data are available for processing now
-    //    hr = spatialAudioStream->EndUpdatingAudioObjects();
-    //} while (objectVector.size() > 0);
-
-
-
     // Stop the stream 
-    hr = spatialAudioStream->Stop();
+    hr = spatialAudioStreamHrtf->Stop();
 
     // We don't want to start again, so reset the stream to free it's resources.
-    hr = spatialAudioStream->Reset();
+    hr = spatialAudioStreamHrtf->Reset();
 
     CloseHandle(bufferCompletionEvent);
 
