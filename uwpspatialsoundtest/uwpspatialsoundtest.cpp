@@ -6,22 +6,26 @@
 #include <random>
 #include <stdlib.h>
 #include <locale.h>
+#include <thread>
 
 #include <windows.foundation.h>
 #include <windowsnumerics.h>
 #include <wrl/wrappers/corewrappers.h>
 #include <wrl/client.h>
 #include <SpatialAudioClient.h>
-#include <SpatialAudioHrtf.h>
 #include <mmdeviceapi.h>
-#include <directxmath.h>
+
+enum FilterType {
+    FilterType_LowPass,
+    FilterType_HighPass,
+    FilterTYpe_LFE
+};
 
 // Audio object struct
 struct Speaker3dObject {
-    Microsoft::WRL::ComPtr<ISpatialAudioObjectForHrtf> audioObject;
+    Microsoft::WRL::ComPtr<ISpatialAudioObject> audioObject;
 	Windows::Foundation::Numerics::float3 position; // In meters
-    SpatialAudioHrtfOrientation* orientation;
-    float gain; // In decibels
+    float volume; // 0.0 to 1.0
     std::vector<float>* wavSample;
     UINT totalFrameCount;
     UINT currFrameIndex;   // Since chunks of audio are written to buffer
@@ -55,7 +59,7 @@ inline void BiquadFilter(std::vector<float>& wavSamples, float a1, float a2, flo
 }
 
 inline void OnePole(std::vector<float>& wavSamples, float freqCutoff, UINT sampleRate) {
-    float a = std::exp(-2.0f * std::_Pi_val * freqCutoff / sampleRate);
+    float a = std::exp(-2.0f * 3.1415926f * freqCutoff / sampleRate);
     float b = 1.0f - a;
     float prevY = 0.0f;
     std::vector<float>::iterator it = wavSamples.begin();
@@ -66,93 +70,105 @@ inline void OnePole(std::vector<float>& wavSamples, float freqCutoff, UINT sampl
     }
 }
 
+// Soft saturator for "boominess"
+inline void SoftSaturator(std::vector<float>& wavSamples, float drive) {
+    std::vector<float>::iterator it = wavSamples.begin();
+    while (it != wavSamples.end()) {
+        *it = std::tanh(drive * (*it));
+        it++;
+    }
+}
+
 // Low-pass filter, uses two second-order IIR filters
-void LowPassFilter(std::vector<float> &wavSamples, float freqCutoff, UINT sampleRate) {
+void LowPassFilter(const std::vector<float> &wavSamples, std::vector<float>*& outWavSamplesPtr, float freqCutoff, UINT sampleRate) {
+    outWavSamplesPtr = new std::vector<float>(wavSamples);
+
     // Approximation of w0 from https://dsp.stackexchange.com/questions/28308/3-db-cut-off-frequency-of-exponentially-weighted-moving-average-filter/28314#28314
     // Biquad filter from https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
 	// The Q values are from 4th-order Butterworth low-pass Perplexity got that I don't feel qualified to understand
-    float w0 = 2.0f * std::_Pi_val * freqCutoff / sampleRate;
+    float w0 = 2.0f * 3.1415926f * freqCutoff / sampleRate;
 	float cosw0 = std::cos(w0);
 	float sinw0 = std::sin(w0);
-    float alpha0 = sinw0 * 0.5f * 0.54119611f;
-	float alpha1 = sinw0 * 0.5f * 1.30656296f;
+    float alpha0 = sinw0 * 0.54119611f / 2;
+	float alpha1 = sinw0 * 1.30656296f / 2;
 
 	float a0 = 1.0f + alpha0;
 	float a1 = -2.0f * cosw0;
 	float a2 = 1.0f - alpha0;
     float b1 = 1.0f - cosw0;
-	float b02 = b1 * 0.5f;
-    BiquadFilter(wavSamples, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
+	float b02 = b1 / 2;
+    BiquadFilter(*outWavSamplesPtr, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
 
     a0 = 1.0f + alpha1;
     a2 = 1.0f - alpha1;
-    BiquadFilter(wavSamples, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
+    BiquadFilter(*outWavSamplesPtr, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
 }
 
 // High-pass filter, same concept
-void HighPassFilter(std::vector<float>& wavSamples, float freqCutoff, UINT sampleRate) {
-    float w0 = 2.0f * std::_Pi_val * freqCutoff / sampleRate;
+void HighPassFilter(const std::vector<float>& wavSamples, std::vector<float>*& outWavSamplesPtr, float freqCutoff, UINT sampleRate) {
+    outWavSamplesPtr = new std::vector<float>(wavSamples);
+
+    float w0 = 2.0f * 3.1415926f * freqCutoff / sampleRate;
     float cosw0 = std::cos(w0);
     float sinw0 = std::sin(w0);
-    float alpha0 = sinw0 * 0.5f * 0.54119611f;
-    float alpha1 = sinw0 * 0.5f * 1.30656296f;
+    float alpha0 = sinw0 * 0.54119611f / 2;
+    float alpha1 = sinw0 * 1.30656296f / 2;
 
     float a0 = 1.0f + alpha0;
     float a1 = -2.0f * cosw0;
     float a2 = 1.0f - alpha0;
     float b1 = -(1.0f + cosw0);
-    float b02 = -b1 * 0.5f;
-    BiquadFilter(wavSamples, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
+    float b02 = -b1 / 2;
+    BiquadFilter(*outWavSamplesPtr, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
 
     a0 = 1.0f + alpha1;
     a2 = 1.0f - alpha1;
-    BiquadFilter(wavSamples, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
+    BiquadFilter(*outWavSamplesPtr, a1 / a0, a2 / a0, b02 / a0, b1 / a0);
 }
 
-// Calculates orientation matrix, provided by Microsoft article
-DirectX::XMMATRIX CalculateEmitterOrientationMatrix(Windows::Foundation::Numerics::float3 listenerOrientationFront, Windows::Foundation::Numerics::float3 emitterDirection)
-{
-    DirectX::XMVECTOR vListenerDirection = DirectX::XMLoadFloat3(&listenerOrientationFront);
-    DirectX::XMVECTOR vEmitterDirection = DirectX::XMLoadFloat3(&emitterDirection);
-    DirectX::XMVECTOR vCross = DirectX::XMVector3Cross(vListenerDirection, vEmitterDirection);
-    DirectX::XMVECTOR vDot = DirectX::XMVector3Dot(vListenerDirection, vEmitterDirection);
-    DirectX::XMVECTOR vAngle = DirectX::XMVectorACos(vDot);
-    float angle = DirectX::XMVectorGetX(vAngle);
+std::vector<float> CombineMono(const std::vector<float>& wavSamples1, const std::vector<float>& wavSamples2) {
+    std::vector<float> outWavSamples;
+    size_t len = min(wavSamples1.size(), wavSamples2.size());
+    outWavSamples.resize(len);
+    for (size_t i = 0; i < len; i++) {
+        outWavSamples[i] = (wavSamples1[i] + wavSamples2[i]) / 2;
+    }
+	return outWavSamples;
+}
 
-    // The angle must be non-zero
-    if (fabsf(angle) > FLT_EPSILON)
-    {
-        // And less than PI
-        if (fabsf(angle) < DirectX::XM_PI)
-        {
-            return DirectX::XMMatrixRotationAxis(vCross, angle);
-        }
+void LFEGenerator(const std::vector<float>& wavSamples1, const std::vector<float>& wavSamples2, std::vector<float>*& outWavSamplesPtr, UINT sampleRate, float sbGain=1.0f, float ubGain=0.5f, float ubDrive=2.0f) {
+    outWavSamplesPtr = new std::vector<float>(CombineMono(wavSamples1, wavSamples2));
+    std::vector<float>* sbWavSamples = nullptr;
+    std::vector<float>* ubWavSamples = nullptr;
 
-        // If equal to PI, find any other non-collinear vector to generate the perpendicular vector to rotate about
-        else
-        {
-            DirectX::XMFLOAT3 vector = { 1.0f, 1.0f, 1.0f };
-            if (listenerOrientationFront.x != 0.0f)
-            {
-                vector.x = -listenerOrientationFront.x;
-            }
-            else if (listenerOrientationFront.y != 0.0f)
-            {
-                vector.y = -listenerOrientationFront.y;
-            }
-            else // if (_listenerOrientationFront.z != 0.0f)
-            {
-                vector.z = -listenerOrientationFront.z;
-            }
-            DirectX::XMVECTOR vVector = DirectX::XMLoadFloat3(&vector);
-            vVector = DirectX::XMVector3Normalize(vVector);
-            vCross = DirectX::XMVector3Cross(vVector, vEmitterDirection);
-            return DirectX::XMMatrixRotationAxis(vCross, angle);
-        }
+    std::vector<std::thread> threads;
+    threads.reserve(2);
+    threads.emplace_back([&] {
+        LowPassFilter(*outWavSamplesPtr, sbWavSamples, 80.0f, sampleRate);
+    });
+    threads.emplace_back([&] {
+        LowPassFilter(*outWavSamplesPtr, ubWavSamples, 200.0f, sampleRate);
+    });
+
+    for (std::thread& t : threads) {
+        t.join();
+    }
+    threads.clear();
+
+    threads.emplace_back([&] {
+        HighPassFilter(*ubWavSamples, ubWavSamples, 80.0f, sampleRate);
+    });
+    threads.emplace_back([&] {
+        SoftSaturator(*ubWavSamples, ubDrive);
+    });
+
+    for (std::thread& t : threads) {
+        t.join();
     }
 
-    // If the angle is zero, use an identity matrix
-    return DirectX::XMMatrixIdentity();
+    for (size_t i = 0; i < (*outWavSamplesPtr).size(); i++) {
+        outWavSamplesPtr->at(i) = sbGain * sbWavSamples->at(i) + ubGain * ubWavSamples->at(i);
+    }
 }
 
 
@@ -304,28 +320,45 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to load WAV (left)." << std::endl;
         return 1;
 	}
-
-	//HighPassFilter(leftWavSamples, 200.0f, wavSampleRate);
-
-    // Resample to 48kHz
-    const UINT targetRate = 48000;
-    if (wavSampleRate != targetRate) {
-        std::vector<float> resampled;
-        ResampleLinear(leftWavSamples, wavSampleRate, targetRate, resampled);
-        leftWavSamples.swap(resampled);
-    }
-
-
     std::vector<float> rightWavSamples;
     if (!LoadWav24ToFloat(rightWavPath, rightWavSamples, wavSampleRate)) {
         std::cerr << "Failed to load WAV (right)." << std::endl;
         return 1;
     }
-    //HighPassFilter(rightWavSamples, 200.0f, wavSampleRate);
+
+    std::vector<float>* monoWavSamplesLFE = nullptr;
+    std::vector<float>* leftWavSamplesMRH = nullptr;
+    std::vector<float>* rightWavSamplesMRH = nullptr;
+
+    std::vector<std::thread> threads;
+    threads.reserve(3);
+    threads.emplace_back([&] {
+        LFEGenerator(leftWavSamples, rightWavSamples, monoWavSamplesLFE, wavSampleRate, 1.0f, 0.6f, 2.0f);
+    });
+    threads.emplace_back([&] {
+        HighPassFilter(leftWavSamples, leftWavSamplesMRH, 200.0f, wavSampleRate);
+    });
+    threads.emplace_back([&] {
+        HighPassFilter(rightWavSamples, rightWavSamplesMRH, 200.0f, wavSampleRate);
+    });
+
+    for (std::thread& t : threads) {
+        t.join();
+    }
+
+    // Resample to 48kHz
+    const UINT targetRate = 48000;
     if (wavSampleRate != targetRate) {
         std::vector<float> resampled;
-        ResampleLinear(rightWavSamples, wavSampleRate, targetRate, resampled);
-        rightWavSamples.swap(resampled);
+
+        ResampleLinear(*leftWavSamplesMRH, wavSampleRate, targetRate, resampled);
+        (*leftWavSamplesMRH).swap(resampled);
+
+        ResampleLinear(*rightWavSamplesMRH, wavSampleRate, targetRate, resampled);
+        (*rightWavSamplesMRH).swap(resampled);
+
+        ResampleLinear(*monoWavSamplesLFE, wavSampleRate, targetRate, resampled);
+        (*monoWavSamplesLFE).swap(resampled);
     }
 
 
@@ -355,16 +388,11 @@ int main(int argc, char* argv[]) {
     Microsoft::WRL::ComPtr<ISpatialAudioClient> spatialAudioClient;
     hr = defaultDevice->Activate(__uuidof(ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**)&spatialAudioClient);
 
-    Microsoft::WRL::ComPtr<ISpatialAudioObjectRenderStreamForHrtf> spatialAudioStreamHrtf;
-	hr = spatialAudioClient->IsSpatialAudioStreamAvailable(__uuidof(ISpatialAudioObjectRenderStreamForHrtf), nullptr);
-    if (FAILED(hr)) {
-        std::cerr << "HRTF spatial audio not supported by spatial audio client." << std::endl;
-        return 1;
-    }
+    Microsoft::WRL::ComPtr<ISpatialAudioObjectRenderStream> spatialAudioStream;
 
     hr = spatialAudioClient->IsAudioObjectFormatSupported(&format);
     if (FAILED(hr)) {
-		std::cerr << "Audio object format not supported by spatial audio client." << std::endl;
+        std::cerr << "Audio object format not supported by spatial audio client." << std::endl;
         return 1;
     }
 
@@ -380,42 +408,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    SpatialAudioHrtfActivationParams streamParams;
+    SpatialAudioObjectRenderStreamActivationParams streamParams;
     streamParams.ObjectFormat = &format;
     streamParams.StaticObjectTypeMask = AudioObjectType_None;
     streamParams.MinDynamicObjectCount = 0;
-    streamParams.MaxDynamicObjectCount = min(maxDynamicObjectCount, 4);
+    streamParams.MaxDynamicObjectCount = min(maxDynamicObjectCount, 20);
     streamParams.Category = AudioCategory_GameEffects;
     streamParams.EventHandle = bufferCompletionEvent;
     streamParams.NotifyObject = nullptr;
-
-	// What is specified by the Microsoft article, with some modifications
-    SpatialAudioHrtfDistanceDecay decayModel;
-    decayModel.CutoffDistance = 20.0f;
-    decayModel.MaxGain = 3.98f;
-    decayModel.MinGain = float(1.58439 * pow(10, -5));
-    decayModel.Type = SpatialAudioHrtfDistanceDecayType::SpatialAudioHrtfDistanceDecay_CustomDecay;
-    decayModel.UnityGainDistance = 1.0f;
-
-    streamParams.DistanceDecay = &decayModel;
-
-    SpatialAudioHrtfDirectivity directivity;
-    directivity.Type = SpatialAudioHrtfDirectivityType::SpatialAudioHrtfDirectivity_Cardioid;
-    directivity.Scaling = 1.0f;
-
-    SpatialAudioHrtfDirectivityCardioid cardioid;
-    cardioid.directivity = directivity;
-	cardioid.Order = 0.0f; // Probably how forward focused the cardioid is, higher is narrower (probably useful for different frequencies)
-
-    SpatialAudioHrtfDirectivityUnion directivityUnion;
-    directivityUnion.Cardiod = cardioid; // Spelling typo
-    streamParams.Directivity = &directivityUnion;
-
-    SpatialAudioHrtfEnvironmentType environment = SpatialAudioHrtfEnvironmentType::SpatialAudioHrtfEnvironment_Small;
-    streamParams.Environment = &environment;
-
-    SpatialAudioHrtfOrientation orientation = { 1,0,0,0,1,0,0,0,1 }; // identity matrix
-    streamParams.Orientation = &orientation;
 
     PROPVARIANT pv;
     PropVariantInit(&pv);
@@ -423,64 +423,52 @@ int main(int argc, char* argv[]) {
     pv.blob.cbSize = sizeof(streamParams);
     pv.blob.pBlobData = (BYTE*)&streamParams;
 
-    hr = spatialAudioClient->ActivateSpatialAudioStream(&pv, __uuidof(spatialAudioStreamHrtf), (void**)&spatialAudioStreamHrtf);
+    hr = spatialAudioClient->ActivateSpatialAudioStream(&pv, __uuidof(spatialAudioStream), (void**)&spatialAudioStream);
 
     // Start streaming / rendering 
-    hr = spatialAudioStreamHrtf->Start();
+    hr = spatialAudioStream->Start();
 
-	std::vector<std::vector<float>> wavSamples = { leftWavSamples, rightWavSamples };
+    std::vector<std::vector<float>> wavSamples = { *leftWavSamplesMRH, *rightWavSamplesMRH, *monoWavSamplesLFE };
     std::vector<Windows::Foundation::Numerics::float3> positions = {
-        Windows::Foundation::Numerics::float3(-1.0f, 0.0f, 0.0f),
-        //Windows::Foundation::Numerics::float3(1.0f, 1.0f, 0.0f)
-	};
-    std::vector<Windows::Foundation::Numerics::float3> directions = {
-		Windows::Foundation::Numerics::float3(1.0f, 0.0f, 0.0f), // Assumed unit vector at the moment
-        Windows::Foundation::Numerics::float3(1.0f, 0.0f, 0.0f)
+        Windows::Foundation::Numerics::float3(-0.5f, -1.0f, -1.0f),
+        Windows::Foundation::Numerics::float3(1.0f, -1.0f, -1.0f),
+        Windows::Foundation::Numerics::float3(-0.5f, 0.0f, 2.0f),
+        Windows::Foundation::Numerics::float3(0.0f, 0.0f, 0.0f)
     };
-	std::vector<size_t> channels = { 0, 1 };
+    std::vector<size_t> channels = { 0, 1, 2, 2 };
+    std::vector<float> volumes = { 0.5f, 0.5f, 0.7f, 0.3f };
     std::vector<Speaker3dObject> speakerObjects;
-
-    Windows::Foundation::Numerics::float3 listenerDirection(0.0f, 0.0f, 1.0f);
+    std::vector<UINT> offsets = { 2040, 2000, 2000, 0 };
 
     // Initializing sound object
     for (size_t i = 0; i < positions.size(); i++) {
-        Microsoft::WRL::ComPtr<ISpatialAudioObjectForHrtf> audioObject;
-        hr = spatialAudioStreamHrtf->ActivateSpatialAudioObjectForHrtf(AudioObjectType::AudioObjectType_Dynamic, &audioObject);
-
-        DirectX::XMFLOAT4X4 rotationMatrix;
-        DirectX::XMMATRIX rotation = CalculateEmitterOrientationMatrix(directions.at(i), listenerDirection);
-        DirectX::XMStoreFloat4x4(&rotationMatrix, rotation); // Unload from vector registor
-        SpatialAudioHrtfOrientation orientation = {
-            rotationMatrix._11, rotationMatrix._12, rotationMatrix._13,
-            rotationMatrix._21, rotationMatrix._22, rotationMatrix._23,
-            rotationMatrix._31, rotationMatrix._32, rotationMatrix._33
-        };
+        Microsoft::WRL::ComPtr<ISpatialAudioObject> audioObject;
+        hr = spatialAudioStream->ActivateSpatialAudioObject(AudioObjectType::AudioObjectType_Dynamic, &audioObject);
 
         speakerObjects.push_back({
             audioObject,
             positions.at(i),
-			&orientation,
-            20.0f,
+            volumes.at(i),
             &wavSamples.at(channels.at(i)),
             static_cast<UINT>(wavSamples.at(channels.at(i)).size()),
-            0
+            offsets.at(i)
         });
     }
 
-	std::cout << "Beginning spatial audio streaming." << std::endl;
-    
-	float rotateAngle = 0.0f;
+    std::cout << "Beginning spatial audio streaming." << std::endl;
+
+    float rotateAngle = 0.0f;
     bool streaming = true;
     while (streaming) {
         // Wait for a signal from the audio-engine to start the next processing pass
-        if (WaitForSingleObject(bufferCompletionEvent, 100) != WAIT_OBJECT_0) {
+        if (WaitForSingleObject(bufferCompletionEvent, 200) != WAIT_OBJECT_0) {
             break;
         }
 
         UINT32 availableDynamicObjectCount;
         UINT32 frameCount;
 
-        hr = spatialAudioStreamHrtf->BeginUpdatingAudioObjects(&availableDynamicObjectCount, &frameCount);
+        hr = spatialAudioStream->BeginUpdatingAudioObjects(&availableDynamicObjectCount, &frameCount);
 
         BYTE* buffer;
         UINT32 bufferLength;
@@ -496,14 +484,8 @@ int main(int argc, char* argv[]) {
                 writeLen = WriteToAudioObjectBuffer(reinterpret_cast<float*>(buffer), frameCount, *(it->wavSample), it->currFrameIndex);
 
                 // Audio object has to be updated for each iteration, will return to default value if only set once
-				hr = it->audioObject->SetPosition(it->position.x, it->position.y, it->position.z);
-                hr = it->audioObject->SetGain(it->gain); // Gain just doesn't work
-				rotateAngle += 0.02f;
-				it->position = Windows::Foundation::Numerics::float3(cos(rotateAngle), 0.0f, sin(rotateAngle));
-				hr = it->audioObject->SetDistanceDecay(&decayModel); // Decay (not cutoff) depends on what direction the audio source is facing, some directions don't have decay at all
-				hr = it->audioObject->SetDirectivity(&directivityUnion); // Directivity likely sets decay rate for different directions
-                hr = it->audioObject->SetEnvironment(environment);
-                hr = it->audioObject->SetOrientation(&orientation);
+                hr = it->audioObject->SetPosition(it->position.x, it->position.y, it->position.z);
+                hr = it->audioObject->SetVolume(it->volume);
 
                 it++;
             }
@@ -511,19 +493,19 @@ int main(int argc, char* argv[]) {
                 hr = it->audioObject->SetEndOfStream(writeLen);
                 it->audioObject = nullptr;
                 it->totalFrameCount = 0;
-				it = speakerObjects.erase(it);
+                it = speakerObjects.erase(it);
                 streaming = false;
             }
         }
 
-        hr = spatialAudioStreamHrtf->EndUpdatingAudioObjects();
+        hr = spatialAudioStream->EndUpdatingAudioObjects();
     }
 
     // Stop the stream 
-    hr = spatialAudioStreamHrtf->Stop();
+    hr = spatialAudioStream->Stop();
 
     // We don't want to start again, so reset the stream to free it's resources.
-    hr = spatialAudioStreamHrtf->Reset();
+    hr = spatialAudioStream->Reset();
 
     CloseHandle(bufferCompletionEvent);
 
