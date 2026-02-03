@@ -8,6 +8,12 @@
 #include <locale.h>
 #include <thread>
 #include <stdio.h>
+#include <string>
+#include <filesystem>
+#include <io.h>
+#include <fcntl.h>
+#include <algorithm>
+#include <chrono>
 
 #include <windows.h>
 #include <windows.foundation.h>
@@ -39,8 +45,8 @@ struct Speaker3dObject {
 enum SpeakerChannels {
     SpeakerChannel_LeftMRH,
     SpeakerChannel_RightMRH,
+    SpeakerChannel_MonoDistortion,
     SpeakerChannel_MonoLFE,
-    SpeakerChannel_MonoImpact
 };
 
 // Writes frameCount samples from PCM sample vector to buffer
@@ -167,7 +173,7 @@ std::vector<float> CombineMono(const std::vector<float>& wavSamples1, const std:
     return outWavSamples;
 }
 
-void LFEAndBoomifier(
+void GenerateLFEAndDistortion(
     const std::vector<float>& wavSamples1,
     const std::vector<float>& wavSamples2,
     std::vector<float>& outWavSamples,
@@ -184,6 +190,21 @@ void LFEAndBoomifier(
 	for (size_t i = 0; i < outWavSamplesSaturated.size(); i++) {
         outWavSamplesSaturated[i] -= outWavSamples[i];
     }
+    SoftSaturator(outWavSamplesSaturated, ubDrive);
+    outWavSamplesSaturated = LowPassFilter(outWavSamplesSaturated, satFreqCutoff, sampleRate);
+}
+
+void GenerateMRHAndSaturation(
+	const std::vector<float>& wavSamples,
+	std::vector<float>& outWavSamples,
+	std::vector<float>& outWavSamplesSaturated,
+    float sbFreqCutoff,
+    float satFreqCutoff,
+    UINT sampleRate,
+    float ubDrive = 2.0f
+) {
+    outWavSamples = HighPassFilter(wavSamples, sbFreqCutoff, sampleRate);
+    outWavSamplesSaturated = outWavSamples;
     SoftSaturator(outWavSamplesSaturated, ubDrive);
     outWavSamplesSaturated = LowPassFilter(outWavSamplesSaturated, satFreqCutoff, sampleRate);
 }
@@ -345,7 +366,7 @@ HRESULT ReadAudioFile(const wchar_t* source, std::vector<float>& leftWavSamples,
 
     hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) {
-        std::cerr << "Failed to initialize Media Foundation." << std::endl;
+        std::wcerr << "Failed to initialize Media Foundation." << std::endl;
         goto done;
     }
 
@@ -376,7 +397,7 @@ HRESULT ReadAudioFile(const wchar_t* source, std::vector<float>& leftWavSamples,
     channelsAttr = MFGetAttributeUINT32(pAudioType, MF_MT_AUDIO_NUM_CHANNELS, 0);
     sampleRateAttr = MFGetAttributeUINT32(pAudioType, MF_MT_AUDIO_SAMPLES_PER_SECOND, 0);
     if (channelsAttr != 2) {
-        std::cerr << "Audio is not stereo." << std::endl;
+        std::wcerr << "Audio is not stereo." << std::endl;
         hr = E_FAIL;
         goto done;
     }
@@ -400,7 +421,7 @@ HRESULT ReadAudioFile(const wchar_t* source, std::vector<float>& leftWavSamples,
             break;
         }
         if (pSample == nullptr) {
-            std::cerr << "No sample." << std::endl;
+            std::wcerr << "No sample." << std::endl;
             continue;
         }
 
@@ -444,16 +465,103 @@ done:
     return hr;
 }
 
-// Spatial audio streaming function
-static HRESULT StreamSpatialAudio(
-    std::vector<std::vector<float>>& wavSamples,
-    float sampleRate,
+void SetupAudioEnvironment(
+    UINT targetRate,
     std::vector<Windows::Foundation::Numerics::float3>& positions,
     std::vector<size_t>& channels,
-    std::vector<float> volumes,
-    std::vector<UINT> offsets,
+    std::vector<float>& volumes,
+    std::vector<UINT>& offsets
+) {
+    float masterVolume = 0.5;
+
+    positions = {
+        Windows::Foundation::Numerics::float3(-0.5f, -0.5f, -1.0f),
+        Windows::Foundation::Numerics::float3(-0.5f, -0.5f, 1.0f),
+
+        Windows::Foundation::Numerics::float3(1.0f, -0.5f, -1.0f),
+        Windows::Foundation::Numerics::float3(1.0f, -0.5f, 1.0f),
+
+        Windows::Foundation::Numerics::float3(0.5f, 0.0f, 0.0f),
+
+        Windows::Foundation::Numerics::float3(-0.5f, -0.5f, 2.0f),
+        Windows::Foundation::Numerics::float3(0.0f, 0.0f, 0.0f),
+        Windows::Foundation::Numerics::float3(1.0f, 0.0f, 0.0f),
+        Windows::Foundation::Numerics::float3(0.5f, 0.0f, 1.0f),
+    };
+    channels = {
+        SpeakerChannel_LeftMRH,
+        SpeakerChannel_LeftMRH,
+
+        SpeakerChannel_RightMRH,
+        SpeakerChannel_RightMRH,
+
+        SpeakerChannel_MonoDistortion,
+
+        SpeakerChannel_MonoLFE,
+        SpeakerChannel_MonoLFE,
+        SpeakerChannel_MonoLFE,
+        SpeakerChannel_MonoLFE,
+    };
+    volumes = {
+        0.25f,
+        0.15f,
+
+        0.25f,
+        0.15f,
+
+        0.6f,
+
+        0.8f,
+        0.4f,
+        0.4f,
+        0.2f,
+    };
+    std::vector<float> delays = {
+        0.0f,
+        0.0f,
+
+        0.0f,
+        0.0f,
+
+        2.0f,
+
+        0.0f,
+        2.0f,
+        2.0f,
+        4.0f,
+    }; // In ms
+
+    // Offsets for sound travel
+    float speedOfSound = 100.0f; // In m/s (more realistically, the "how-wide-o-stat")
+
+    offsets.resize(positions.size());
+
+    float samplesPerMeter = static_cast<float>(targetRate) / speedOfSound;
+    float samplesPerMillisecond = static_cast<float>(targetRate) / 1000.0f;
+    UINT maxOffset = 0;
+    for (size_t i = 0; i < positions.size(); i++) {
+        offsets[i] = static_cast<UINT>((Windows::Foundation::Numerics::length(positions[i]) * samplesPerMeter) + (delays[i] * samplesPerMillisecond));
+        if (offsets[i] > maxOffset) {
+            maxOffset = offsets[i];
+        }
+    }
+    for (size_t i = 0; i < offsets.size(); i++) {
+        offsets[i] = maxOffset - offsets[i];
+    }
+
+    // Applying master volume
+    for (float& volume : volumes) {
+        volume *= masterVolume;
+    }
+}
+
+static HRESULT SetupAudioDevices(
+    Microsoft::WRL::ComPtr<ISpatialAudioObjectRenderStream>& spatialAudioStream,
+    HANDLE& bufferCompletionEvent,
+    UINT targetRate,
     HRESULT& hr
 ) {
+
     // This is where we get the audio device
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> deviceEnum;
     Microsoft::WRL::ComPtr<IMMDevice> defaultDevice;
@@ -466,7 +574,7 @@ static HRESULT StreamSpatialAudio(
     format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
     format.wBitsPerSample = 32;
     format.nChannels = 1;
-    format.nSamplesPerSec = sampleRate;
+    format.nSamplesPerSec = targetRate;
     format.nBlockAlign = (format.wBitsPerSample >> 3) * format.nChannels;
     format.nAvgBytesPerSec = format.nBlockAlign * format.nSamplesPerSec;
     format.cbSize = 0;
@@ -475,16 +583,14 @@ static HRESULT StreamSpatialAudio(
     Microsoft::WRL::ComPtr<ISpatialAudioClient> spatialAudioClient;
     hr = defaultDevice->Activate(__uuidof(ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**)&spatialAudioClient);
 
-    Microsoft::WRL::ComPtr<ISpatialAudioObjectRenderStream> spatialAudioStream;
-
     hr = spatialAudioClient->IsAudioObjectFormatSupported(&format);
     if (FAILED(hr)) {
-        std::cerr << "Audio object format not supported by spatial audio client." << std::endl;
+        std::wcerr << "Audio object format not supported by spatial audio client." << std::endl;
         return hr;
     }
 
     // Create the event that will be used to signal the client for more data
-    HANDLE bufferCompletionEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    bufferCompletionEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
     // 220 max dynamic objects for Windows Sonic UWP
     UINT32 maxDynamicObjectCount;
@@ -512,6 +618,20 @@ static HRESULT StreamSpatialAudio(
 
     hr = spatialAudioClient->ActivateSpatialAudioStream(&pv, __uuidof(spatialAudioStream), (void**)&spatialAudioStream);
 
+    return hr;
+}
+
+// Spatial audio streaming function
+static HRESULT StreamSpatialAudio(
+    Microsoft::WRL::ComPtr<ISpatialAudioObjectRenderStream>& spatialAudioStream,
+    HANDLE& bufferCompletionEvent,
+    std::vector<std::vector<float>>& wavSamples,
+    std::vector<Windows::Foundation::Numerics::float3>& positions,
+    std::vector<size_t>& channels,
+    std::vector<float> volumes,
+    std::vector<UINT> offsets,
+    HRESULT& hr
+) {
     // Initializing sound object
     std::vector<Speaker3dObject> speakerObjects;
     for (size_t i = 0; i < positions.size(); i++) {
@@ -528,9 +648,9 @@ static HRESULT StreamSpatialAudio(
         });
     }
 
-    std::cout << "Beginning spatial audio streaming." << std::endl;
+    std::wcout << "Beginning spatial audio streaming." << std::endl;
 
-    // Start streaming / rendering 
+    // Start streaming / rendering
     hr = spatialAudioStream->Start();
 
     float rotateAngle = 0.0f;
@@ -594,85 +714,128 @@ int main(int argc, char* argv[]) {
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     if (FAILED(hr)) {
-        std::cerr << "Failed to initialize COM library." << std::endl;
+        std::wcerr << "Failed to initialize COM library." << std::endl;
         return 1;
     }
 
-    // Getting WAV file (test file uses 24-bit, mono, 44.100kHz at the moment)
-    if (argc < 2) {
-		std::cerr << "Need a path to an audio file as an argument." << std::endl;
+    Microsoft::WRL::ComPtr<ISpatialAudioObjectRenderStream> spatialAudioStream;
+    HANDLE bufferCompletionEvent;
+    UINT targetRate = 48000;
+    std::vector<Windows::Foundation::Numerics::float3> positions;
+    std::vector<size_t> channels;
+    std::vector<float> volumes;
+    std::vector<UINT> offsets;
+    SetupAudioEnvironment(targetRate, positions, channels, volumes, offsets);
+
+    // For non-Latin characters
+    if (_setmode(_fileno(stdin), _O_U16TEXT) == -1) {
+        std::wcerr << "stdin UTF16 mode failed." << std::endl;
         return 1;
     }
-	
-	std::setlocale(LC_ALL, ""); // Default locale
-	size_t requiredSize = strlen(argv[1]) + 1;
-	wchar_t* wavPath = new wchar_t[requiredSize];
-    size_t outWSize;
-	mbstowcs_s(&outWSize, wavPath, requiredSize, argv[1], requiredSize - 1);
+    if (_setmode(_fileno(stdout), _O_U16TEXT) == -1) {
+        std::wcerr << "stdout UTF16 mode failed." << std::endl;
+        return 1;
+    }
 
-    std::wcout << "Loading file: " << wavPath << std::endl;
+    // Getting file
+    std::wcout << "Path to folder (in quotations): ";
+    std::wstring dirPath;
+	std::getline(std::wcin, dirPath);
+    dirPath.pop_back();
+    dirPath.erase(0, 1);
+    std::wcout << std::endl;
+    std::vector<std::wstring> wavPaths;
+
+
+    if (std::filesystem::is_directory(dirPath)) {
+        std::wcout << "Loading folder: " << dirPath << std::endl;
+        for (const auto& entry : std::filesystem::directory_iterator(dirPath)) {
+            if (std::filesystem::exists(entry.path()) && std::filesystem::is_regular_file(entry.path())) {
+                wavPaths.push_back(entry.path());
+            }
+        }
+        UINT seed = (UINT)std::chrono::system_clock::now().time_since_epoch().count();
+        std::mt19937 gen(seed);
+        std::shuffle(std::begin(wavPaths), std::end(wavPaths), gen);
+    }
+    else {
+        wavPaths.push_back(dirPath);
+    }
 
     // Load WAV samples into vector<float>
 	std::vector<float> leftWavSamples;
+    leftWavSamples.resize(33554432);
     std::vector<float> rightWavSamples;
-    UINT wavSampleRate;
-    hr = ReadAudioFile(wavPath, leftWavSamples, rightWavSamples, wavSampleRate, hr);
-    if (FAILED(hr)) {
-        std::cerr << "File loading failed." << std::endl;
-        return 1;
-    }
-
-    // Resample to 48kHz
-    UINT targetRate = 48000;
-    std::vector<std::thread> threads;
-    threads.reserve(2);
-    threads.emplace_back([&] {
-        hr = ResampleAudio(leftWavSamples, wavSampleRate, targetRate, hr);
-    });
-    threads.emplace_back([&] {
-        hr = ResampleAudio(rightWavSamples, wavSampleRate, targetRate, hr);
-    });
-    for (std::thread& t : threads) {
-        t.join();
-    }
-    if (FAILED(hr)) {
-        std::cerr << "Audio resampling failed." << std::endl;
-        return 1;
-    }
-
+    rightWavSamples.resize(33554432);
     std::vector<std::vector<float>> wavSamples;
-    wavSamples.resize(4);
+    wavSamples.resize(5);
+    for (std::vector<float>& wavSample : wavSamples) {
+        wavSample.resize(33554432);
+    }
+    UINT wavSampleRate;
+    for (const std::wstring& wavPath : wavPaths) {
 
-    threads.clear();
-    threads.reserve(3);
-    threads.emplace_back([&] {
-        LFEAndBoomifier(leftWavSamples, rightWavSamples, wavSamples[SpeakerChannel_MonoLFE], wavSamples[SpeakerChannel_MonoImpact], 80.0f, 100.0f, wavSampleRate, 4.0f);
-    });
-    threads.emplace_back([&] {
-        wavSamples[SpeakerChannel_LeftMRH] = HighPassFilter(leftWavSamples, 80.0f, wavSampleRate);
-    });
-    threads.emplace_back([&] {
-        wavSamples[SpeakerChannel_RightMRH] = HighPassFilter(rightWavSamples, 80.0f, wavSampleRate);
-    });
-    for (std::thread& t : threads) {
-        t.join();
+        SetupAudioDevices(spatialAudioStream, bufferCompletionEvent, targetRate, hr);
+        if (FAILED(hr)) {
+            std::wcerr << "Spatial audio setup failed." << std::endl;
+            return 1;
+        }
+
+        std::wcout << "Loading file: " << wavPath << std::endl;
+        hr = ReadAudioFile(wavPath.c_str(), leftWavSamples, rightWavSamples, wavSampleRate, hr);
+        if (FAILED(hr)) {
+            std::wcerr << "File loading failed." << std::endl;
+            continue;
+        }
+        std::wcout << "Buffer size: " << rightWavSamples.size() << std::endl;
+
+        // Resample to 48kHz
+        // Memory management sucks here
+        std::vector<std::thread> threads;
+        threads.reserve(2);
+        threads.emplace_back([&] {
+            hr = ResampleAudio(leftWavSamples, wavSampleRate, targetRate, hr);
+        });
+        threads.emplace_back([&] {
+            hr = ResampleAudio(rightWavSamples, wavSampleRate, targetRate, hr);
+        });
+        for (std::thread& t : threads) {
+            t.join();
+        }
+        if (FAILED(hr)) {
+            std::wcerr << "Audio resampling failed." << std::endl;
+            continue;
+        }
+        std::wcout << "Buffer size (resampled): " << rightWavSamples.size() << std::endl;
+
+        threads.clear();
+        threads.reserve(3);
+        threads.emplace_back([&] {
+		    GenerateLFEAndDistortion(leftWavSamples, rightWavSamples, wavSamples[SpeakerChannel_MonoLFE], wavSamples[SpeakerChannel_MonoDistortion], 80.0f, 100.0f, wavSampleRate, 2.8f);
+        });
+        threads.emplace_back([&] {
+            wavSamples[SpeakerChannel_LeftMRH] = HighPassFilter(leftWavSamples, 80.0f, wavSampleRate);
+        });
+        threads.emplace_back([&] {
+            wavSamples[SpeakerChannel_RightMRH] = HighPassFilter(rightWavSamples, 80.0f, wavSampleRate);
+        });
+        for (std::thread& t : threads) {
+            t.join();
+        }
+        leftWavSamples.clear();
+        rightWavSamples.clear();
+
+        hr = StreamSpatialAudio(spatialAudioStream, bufferCompletionEvent, wavSamples, positions, channels, volumes, offsets, hr);
+
+        for (std::vector<float>& wavSample : wavSamples) {
+            wavSample.clear();
+        }
+
+        if (FAILED(hr)) {
+            std::wcerr << "Spatial audio streaming failed." << std::endl;
+            return 1;
+	    }
     }
 
-    std::vector<Windows::Foundation::Numerics::float3> positions = {
-        Windows::Foundation::Numerics::float3(-0.5f, -1.0f, -1.0f),
-        Windows::Foundation::Numerics::float3(1.0f, -1.0f, -1.0f),
-        Windows::Foundation::Numerics::float3(-0.5f, 0.0f, 2.0f),
-        Windows::Foundation::Numerics::float3(0.0f, 0.0f, 0.0f)
-    };
-    std::vector<size_t> channels = { 0, 1, 2, 3 };
-    std::vector<float> volumes = { 0.5f, 0.5f, 1.0f, 0.5f };
-    std::vector<UINT> offsets = { 480, 0, 480, 0 };
-
-    hr = StreamSpatialAudio(wavSamples, targetRate, positions, channels, volumes, offsets, hr);
-
-    if (FAILED(hr)) {
-        std::cerr << "Spatial audio streaming failed." << std::endl;
-        return 1;
-	}
     return 0;
 }
