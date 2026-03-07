@@ -219,150 +219,18 @@ template <class T> void SafeRelease(T** ppT)
     }
 }
 
-// Resampler using Windows Media Foundation, assisted by Copilot
-HRESULT ResampleAudio(std::vector<float>& wavSamples, UINT sampleRate, UINT targetRate, HRESULT& hr) {
-    IMFTransform* pResampler = nullptr;
-    IMFMediaType* pInType = nullptr;
-    IMFMediaType* pOutType = nullptr;
-    IMFSample* pSample = nullptr;
-    IMFMediaBuffer* pBuffer = nullptr;
-
-    size_t inBytes;
-    BYTE* pData = nullptr;
-    DWORD cbMax = 0;
-    DWORD cbCurr = 0;
-
-    std::vector<float> outWavSamples;
-
-    UINT32 frameSize = sizeof(float);
-    UINT32 bytesPerSecond;
-
-    MFT_OUTPUT_STREAM_INFO streamInfo = {};
-    DWORD status = 0;
-    MFT_OUTPUT_DATA_BUFFER outBuffer = {};
-
-    if (sampleRate == targetRate) goto done;
-
-    hr = CoCreateInstance(CLSID_AudioResamplerMediaObject, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&pResampler));
-    if (FAILED(hr)) goto done;
-
-    hr = MFCreateMediaType(&pInType);
-    hr = pInType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    hr = pInType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
-    hr = pInType->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 1);
-    hr = pInType->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sampleRate);
-    hr = pInType->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 32);
-    hr = pInType->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, frameSize);
-    bytesPerSecond = frameSize * static_cast<UINT32>(sampleRate);
-    hr = pInType->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytesPerSecond);
-    if (FAILED(hr)) goto done;
-
-    hr = pResampler->SetInputType(0, pInType, 0);
-    if (FAILED(hr)) goto done;
-
-    hr = MFCreateMediaType(&pOutType);
-    hr = pOutType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    hr = pOutType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
-    hr = pOutType->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 1);
-    hr = pOutType->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, targetRate);
-    hr = pOutType->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 32);
-    hr = pOutType->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, sizeof(float));
-    hr = pOutType->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, frameSize);
-    bytesPerSecond = frameSize * static_cast<UINT32>(targetRate);
-    hr = pOutType->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytesPerSecond);
-    if (FAILED(hr)) goto done;
-
-
-    hr = pResampler->SetOutputType(0, pOutType, 0);
-    if (FAILED(hr)) goto done;
-
-    // Prepare a single input sample containing all input frames (one-shot)
-    inBytes = wavSamples.size() * sizeof(float);
-    if (inBytes == 0) { hr = S_OK; goto done; }
-
-    hr = MFCreateMemoryBuffer(static_cast<DWORD>(inBytes), &pBuffer);
-    if (FAILED(hr)) goto done;
-
-    // Copy samples into buffer
-    hr = pBuffer->Lock(&pData, &cbMax, &cbCurr);
-    if (FAILED(hr)) goto done;
-    memcpy(pData, wavSamples.data(), inBytes);
-    hr = pBuffer->SetCurrentLength(static_cast<DWORD>(inBytes));
-    pBuffer->Unlock();
-    if (FAILED(hr)) goto done;
-
-    hr = MFCreateSample(&pSample);
-    if (FAILED(hr)) goto done;
-    hr = pSample->AddBuffer(pBuffer);
-    if (FAILED(hr)) goto done;
-
-    // Feed the input to the resampler
-    hr = pResampler->ProcessInput(0, pSample, 0);
-    if (FAILED(hr)) goto done;
-
-    // Pull output; ProcessOutput may return multiple output samples.
-
-    while (true) {
-        IMFSample* pOutSample = nullptr;
-        IMFMediaBuffer* pOutMediaBuffer = nullptr;
-
-        hr = MFCreateSample(&pOutSample);
-        hr = MFCreateMemoryBuffer(static_cast<DWORD>(inBytes), &pOutMediaBuffer);
-        hr = pOutSample->AddBuffer(pOutMediaBuffer);
-        outBuffer.pSample = pOutSample;
-        hr = pResampler->ProcessOutput(0, 1, &outBuffer, &status);
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            hr = S_OK;
-            break;
-        }
-        if (FAILED(hr)) break;
-
-        pOutSample = outBuffer.pSample;
-        if (pOutSample) {
-            hr = pOutSample->ConvertToContiguousBuffer(&pOutMediaBuffer);
-            if (SUCCEEDED(hr) && pOutMediaBuffer) {
-                BYTE* pOutData = nullptr;
-                DWORD cbMax = 0;
-                DWORD cbCurr = 0;
-                hr = pOutMediaBuffer->Lock(&pOutData, &cbMax, &cbCurr);
-                if (SUCCEEDED(hr)) {
-                    size_t outFloats = cbCurr / sizeof(float);
-                    size_t prev = outWavSamples.size();
-                    outWavSamples.resize(prev + outFloats);
-                    memcpy(outWavSamples.data() + prev, pOutData, cbCurr);
-                    pOutMediaBuffer->Unlock();
-                }
-                SafeRelease(&pOutMediaBuffer);
-            }
-            SafeRelease(&pOutSample);
-        }
-    }
-
-    wavSamples.swap(outWavSamples);
-
-done:
-    SafeRelease(&pSample);
-    SafeRelease(&pBuffer);
-    SafeRelease(&pInType);
-    SafeRelease(&pOutType);
-    SafeRelease(&pResampler);
-    return hr;
-}
-
 // Audio file read function using Windows Media Foundation, from https://learn.microsoft.com/en-us/windows/win32/medfound/tutorial--decoding-audio
-HRESULT ReadAudioFile(const wchar_t* source, std::vector<float>& leftWavSamples, std::vector<float>& rightWavSamples, UINT& sampleRate, HRESULT& hr) {
+HRESULT ReadAudioFile(const wchar_t* source, std::vector<float>& leftWavSamples, std::vector<float>& rightWavSamples, UINT32 targetRate, HRESULT& hr) {
 	IMFSourceReader* pReader = nullptr;
     IMFMediaType* pPartialType = nullptr;
     IMFMediaType* pAudioType = nullptr;    // Represents the PCM audio format.
 
-    DWORD cbAudioData = 0;
     DWORD cbBuffer = 0;
     BYTE* pAudioData = nullptr;
 	IMFSample* pSample = nullptr;
     IMFMediaBuffer* pBuffer = nullptr;
 
     UINT32 channelsAttr;
-    UINT32 sampleRateAttr;
 
     hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) {
@@ -384,6 +252,7 @@ HRESULT ReadAudioFile(const wchar_t* source, std::vector<float>& leftWavSamples,
     hr = MFCreateMediaType(&pPartialType);
     hr = pPartialType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
     hr = pPartialType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
+    hr = pPartialType->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, targetRate);
 
     hr = pReader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, pPartialType);
 
@@ -393,15 +262,13 @@ HRESULT ReadAudioFile(const wchar_t* source, std::vector<float>& leftWavSamples,
     // Ensure the stream is selected.
     hr = pReader->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE);
 
-    // Get sample rate and check if stereo
+    // Check if stereo
     channelsAttr = MFGetAttributeUINT32(pAudioType, MF_MT_AUDIO_NUM_CHANNELS, 0);
-    sampleRateAttr = MFGetAttributeUINT32(pAudioType, MF_MT_AUDIO_SAMPLES_PER_SECOND, 0);
     if (channelsAttr != 2) {
         std::wcerr << "Audio is not stereo." << std::endl;
         hr = E_FAIL;
         goto done;
     }
-    sampleRate = static_cast<UINT>(sampleRateAttr);
 
     // Return the PCM format to the caller.
     pAudioType->AddRef();
@@ -509,12 +376,12 @@ void SetupAudioEnvironment(
         0.25f,
         0.15f,
 
-        0.6f,
+        0.4f,
 
-        0.8f,
-        0.4f,
-        0.4f,
-        0.2f,
+        0.6f,
+        0.3f,
+        0.3f,
+        0.1f,
     };
     std::vector<float> delays = {
         0.0f,
@@ -720,7 +587,7 @@ int main(int argc, char* argv[]) {
 
     Microsoft::WRL::ComPtr<ISpatialAudioObjectRenderStream> spatialAudioStream;
     HANDLE bufferCompletionEvent;
-    UINT targetRate = 48000;
+    UINT32 targetRate = 48000;
     std::vector<Windows::Foundation::Numerics::float3> positions;
     std::vector<size_t> channels;
     std::vector<float> volumes;
@@ -772,7 +639,6 @@ int main(int argc, char* argv[]) {
     for (std::vector<float>& wavSample : wavSamples) {
         wavSample.resize(33554432);
     }
-    UINT wavSampleRate;
     for (const std::wstring& wavPath : wavPaths) {
 
         SetupAudioDevices(spatialAudioStream, bufferCompletionEvent, targetRate, hr);
@@ -782,42 +648,24 @@ int main(int argc, char* argv[]) {
         }
 
         std::wcout << "Loading file: " << wavPath << std::endl;
-        hr = ReadAudioFile(wavPath.c_str(), leftWavSamples, rightWavSamples, wavSampleRate, hr);
+        hr = ReadAudioFile(wavPath.c_str(), leftWavSamples, rightWavSamples, targetRate, hr);
         if (FAILED(hr)) {
             std::wcerr << "File loading failed." << std::endl;
             continue;
         }
         std::wcout << "Buffer size: " << rightWavSamples.size() << std::endl;
 
-        // Resample to 48kHz
-        // Memory management sucks here
         std::vector<std::thread> threads;
-        threads.reserve(2);
-        threads.emplace_back([&] {
-            hr = ResampleAudio(leftWavSamples, wavSampleRate, targetRate, hr);
-        });
-        threads.emplace_back([&] {
-            hr = ResampleAudio(rightWavSamples, wavSampleRate, targetRate, hr);
-        });
-        for (std::thread& t : threads) {
-            t.join();
-        }
-        if (FAILED(hr)) {
-            std::wcerr << "Audio resampling failed." << std::endl;
-            continue;
-        }
-        std::wcout << "Buffer size (resampled): " << rightWavSamples.size() << std::endl;
-
         threads.clear();
         threads.reserve(3);
         threads.emplace_back([&] {
-		    GenerateLFEAndDistortion(leftWavSamples, rightWavSamples, wavSamples[SpeakerChannel_MonoLFE], wavSamples[SpeakerChannel_MonoDistortion], 80.0f, 100.0f, wavSampleRate, 2.8f);
+		    GenerateLFEAndDistortion(leftWavSamples, rightWavSamples, wavSamples[SpeakerChannel_MonoLFE], wavSamples[SpeakerChannel_MonoDistortion], 80.0f, 100.0f, targetRate, 2.8f);
         });
         threads.emplace_back([&] {
-            wavSamples[SpeakerChannel_LeftMRH] = HighPassFilter(leftWavSamples, 80.0f, wavSampleRate);
+            wavSamples[SpeakerChannel_LeftMRH] = HighPassFilter(leftWavSamples, 80.0f, targetRate);
         });
         threads.emplace_back([&] {
-            wavSamples[SpeakerChannel_RightMRH] = HighPassFilter(rightWavSamples, 80.0f, wavSampleRate);
+            wavSamples[SpeakerChannel_RightMRH] = HighPassFilter(rightWavSamples, 80.0f, targetRate);
         });
         for (std::thread& t : threads) {
             t.join();
