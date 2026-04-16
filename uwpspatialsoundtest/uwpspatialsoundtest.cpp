@@ -339,7 +339,7 @@ void SetupAudioEnvironment(
     std::vector<float>& volumes,
     std::vector<UINT>& offsets
 ) {
-    float masterVolume = 0.5;
+    float masterVolume = 0.7;
 
     positions = {
         Windows::Foundation::Numerics::float3(-0.5f, -0.5f, -1.0f),
@@ -348,14 +348,31 @@ void SetupAudioEnvironment(
         Windows::Foundation::Numerics::float3(1.0f, -0.5f, -1.0f),
         Windows::Foundation::Numerics::float3(1.0f, -0.5f, 1.0f),
 
+        Windows::Foundation::Numerics::float3(1.0f, -0.5f, -1.0f),
+        Windows::Foundation::Numerics::float3(-0.5f, -0.5f, 1.0f),
+
+        Windows::Foundation::Numerics::float3(-0.5f, -0.5f, -1.0f),
+        Windows::Foundation::Numerics::float3(1.0f, -0.5f, 1.0f),
+
         Windows::Foundation::Numerics::float3(0.5f, 0.0f, 0.0f),
 
         Windows::Foundation::Numerics::float3(-0.5f, -0.5f, 2.0f),
-        Windows::Foundation::Numerics::float3(0.0f, 0.0f, 0.0f),
-        Windows::Foundation::Numerics::float3(1.0f, 0.0f, 0.0f),
-        Windows::Foundation::Numerics::float3(0.5f, 0.0f, 1.0f),
+        Windows::Foundation::Numerics::float3(0.25f, 0.0f, 1.75f),
+        Windows::Foundation::Numerics::float3(0.25f, 0.0f, 1.5f),
+        Windows::Foundation::Numerics::float3(0.25f, 0.0f, 1.25f),
+        Windows::Foundation::Numerics::float3(0.25f, 0.0f, 1.0f),
+        Windows::Foundation::Numerics::float3(0.25f, 0.0f, 0.75f),
+        Windows::Foundation::Numerics::float3(0.25f, 0.0f, 0.5f),
+        Windows::Foundation::Numerics::float3(0.25f, 0.0f, 0.25f),
+        Windows::Foundation::Numerics::float3(0.25f, 0.0f, 0.0f),
     };
     channels = {
+        SpeakerChannel_LeftMRH,
+        SpeakerChannel_LeftMRH,
+
+        SpeakerChannel_RightMRH,
+        SpeakerChannel_RightMRH,
+
         SpeakerChannel_LeftMRH,
         SpeakerChannel_LeftMRH,
 
@@ -368,6 +385,11 @@ void SetupAudioEnvironment(
         SpeakerChannel_MonoLFE,
         SpeakerChannel_MonoLFE,
         SpeakerChannel_MonoLFE,
+        SpeakerChannel_MonoLFE,
+        SpeakerChannel_MonoLFE,
+        SpeakerChannel_MonoLFE,
+        SpeakerChannel_MonoLFE,
+        SpeakerChannel_MonoLFE,
     };
     volumes = {
         0.25f,
@@ -376,12 +398,23 @@ void SetupAudioEnvironment(
         0.25f,
         0.15f,
 
-        0.4f,
+        0.10f,
+        0.15f,
 
-        0.6f,
+        0.10f,
+        0.15f,
+
+        0.2f,
+
+        0.5f,
         0.3f,
+        0.2f,
+        0.2f,
+        0.2f,
+        0.2f,
+        0.2f,
         0.3f,
-        0.1f,
+        0.4f,
     };
     std::vector<float> delays = {
         0.0f,
@@ -390,16 +423,27 @@ void SetupAudioEnvironment(
         0.0f,
         0.0f,
 
-        2.0f,
+        20.0f,
+        50.0f,
+
+        20.0f,
+        50.0f,
+
+        15.0f,
 
         0.0f,
-        2.0f,
-        2.0f,
-        4.0f,
+        0.1f,
+        0.2f,
+        0.4f,
+        0.8f,
+        1.6f,
+        3.2f,
+        6.4f,
+        12.8f,
     }; // In ms
 
     // Offsets for sound travel
-    float speedOfSound = 100.0f; // In m/s (more realistically, the "how-wide-o-stat")
+    float speedOfSound = 272.0f; // In m/s (more realistically, the "how-wide-o-stat")
 
     offsets.resize(positions.size());
 
@@ -459,20 +503,20 @@ static HRESULT SetupAudioDevices(
     // Create the event that will be used to signal the client for more data
     bufferCompletionEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
-    // 220 max dynamic objects for Windows Sonic UWP
+    // 128 max dynamic objects for Windows Sonic
     UINT32 maxDynamicObjectCount;
     hr = spatialAudioClient->GetMaxDynamicObjectCount(&maxDynamicObjectCount);
 
     if (maxDynamicObjectCount == 0) {
         // Dynamic objects are unsupported
-        return hr;
+        return E_NOTIMPL;
     }
 
     SpatialAudioObjectRenderStreamActivationParams streamParams;
     streamParams.ObjectFormat = &format;
     streamParams.StaticObjectTypeMask = AudioObjectType_None;
     streamParams.MinDynamicObjectCount = 0;
-    streamParams.MaxDynamicObjectCount = min(maxDynamicObjectCount, 20);
+    streamParams.MaxDynamicObjectCount = maxDynamicObjectCount;
     streamParams.Category = AudioCategory_GameEffects;
     streamParams.EventHandle = bufferCompletionEvent;
     streamParams.NotifyObject = nullptr;
@@ -537,6 +581,9 @@ static HRESULT StreamSpatialAudio(
         UINT32 bufferLength;
 
         std::vector<Speaker3dObject>::iterator it = speakerObjects.begin();
+        if (it == speakerObjects.end()) {
+            streaming = false;
+        }
         while (it != speakerObjects.end()) {
             hr = it->audioObject->GetBuffer(&buffer, &bufferLength);
             UINT writeLen = 0;
@@ -557,7 +604,6 @@ static HRESULT StreamSpatialAudio(
                 it->audioObject = nullptr;
                 it->totalFrameCount = 0;
                 it = speakerObjects.erase(it);
-                streaming = false;
             }
         }
 
@@ -567,7 +613,7 @@ static HRESULT StreamSpatialAudio(
     // Stop the stream 
     hr = spatialAudioStream->Stop();
 
-    // We don't want to start again, so reset the stream to free it's resources.
+    // We don't want to start again, so reset the stream to free its resources.
     hr = spatialAudioStream->Reset();
 
     CloseHandle(bufferCompletionEvent);
@@ -641,8 +687,8 @@ int main(int argc, char* argv[]) {
     }
     for (const std::wstring& wavPath : wavPaths) {
 
-        SetupAudioDevices(spatialAudioStream, bufferCompletionEvent, targetRate, hr);
-        if (FAILED(hr)) {
+        hr = SetupAudioDevices(spatialAudioStream, bufferCompletionEvent, targetRate, hr);
+        if (FAILED(hr) || !spatialAudioStream) {
             std::wcerr << "Spatial audio setup failed." << std::endl;
             return 1;
         }
@@ -659,13 +705,13 @@ int main(int argc, char* argv[]) {
         threads.clear();
         threads.reserve(3);
         threads.emplace_back([&] {
-		    GenerateLFEAndDistortion(leftWavSamples, rightWavSamples, wavSamples[SpeakerChannel_MonoLFE], wavSamples[SpeakerChannel_MonoDistortion], 80.0f, 100.0f, targetRate, 2.8f);
+		    GenerateLFEAndDistortion(leftWavSamples, rightWavSamples, wavSamples[SpeakerChannel_MonoLFE], wavSamples[SpeakerChannel_MonoDistortion], 80.0f, 100.0f, targetRate, 2.2f);
         });
         threads.emplace_back([&] {
-            wavSamples[SpeakerChannel_LeftMRH] = HighPassFilter(leftWavSamples, 80.0f, targetRate);
+            wavSamples[SpeakerChannel_LeftMRH] = HighPassFilter(leftWavSamples, 100.0f, targetRate);
         });
         threads.emplace_back([&] {
-            wavSamples[SpeakerChannel_RightMRH] = HighPassFilter(rightWavSamples, 80.0f, targetRate);
+            wavSamples[SpeakerChannel_RightMRH] = HighPassFilter(rightWavSamples, 100.0f, targetRate);
         });
         for (std::thread& t : threads) {
             t.join();
